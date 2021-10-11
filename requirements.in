@@ -1,0 +1,8 @@
+httpx==1.0.0b0
+typer
+attrs
+aiofiles
+tqdm
+arrow
+starlette
+uvicorn

@@ -172,7 +172,7 @@ async def process_all(
     to try them out.
     """
     queue: asyncio.Queue[CredPair] = asyncio.Queue(maxsize=queue_maxsize)
-    pbar = tqdm(unit=" requests")
+    pbar = tqdm(unit=" requests", leave=False)
 
     stop_event = asyncio.Event()
     found_event = asyncio.Event()

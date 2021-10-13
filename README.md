@@ -33,6 +33,4 @@ $ python -m server --help
 
 ## TODO
 
-- if an exception is raised in the tasks, we don't know about it because we're only awaiting
-  the event.
 - fix jumpy tdqm progress bar? <https://github.com/tqdm/tqdm/pull/1262>

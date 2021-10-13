@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -17,12 +18,14 @@ class CredPair:
     username: str
     password: str
 
+    def json_str(self) -> str:
+        return json.dumps(attr.asdict(self))
+
 
 async def get(
     cred_pair: CredPair,
     request: httpx.Request,
     client: httpx.AsyncClient,
-    pbar: tqdm,
 ) -> bool:
     """
     Return True if the request against URL with the credentials in cred_pair has a
@@ -41,7 +44,6 @@ async def get(
             # just log and try again? maybe do some kind of congestion control later
             await log.warn(
                 f"Retrying because read timeout for request {request} and {cred_pair}",
-                pbar=pbar,
             )
 
 
@@ -63,7 +65,6 @@ async def consumer(
     pbar: tqdm,
     url: str,
     stop_on_found: bool,
-    stop_event: asyncio.Event,
     found_event: asyncio.Event,
 ) -> None:
     """
@@ -72,7 +73,7 @@ async def consumer(
     If one is successful, set the found_event and, if stop_on_found is True, also set
     the stop_event.
     """
-    await log.debug("Starting HTTP request worker...", pbar=pbar)
+    await log.debug("Starting HTTP request worker...")
 
     async with httpx.AsyncClient() as client:
         request = client.build_request("GET", url)
@@ -84,7 +85,6 @@ async def consumer(
                 cred_pair=cred_pair,
                 request=request,
                 client=client,
-                pbar=pbar,
             )
 
             queue.task_done()
@@ -98,27 +98,27 @@ async def consumer(
             pbar.update()
 
             if result:
-                await log.info("Found working credentials 😀", pbar=pbar)
-                pbar.write(
-                    f'username="{cred_pair.username}", password="{cred_pair.password}"'
-                )
                 found_event.set()
+                await log.info("Found working credentials 😀")
+                pbar.write(
+                    cred_pair.json_str(),
+                    file=sys.stdout,
+                )
                 if stop_on_found:
-                    stop_event.set()
+                    return
 
 
 async def producer(
     username_path: Path,
     password_path: Path,
     queue: asyncio.Queue[CredPair],
-    stop_event: asyncio.Event,
     pbar: tqdm,
 ) -> None:
     """
     Populate the queue with username:password pairs and wait for the queue to be
     emptied. On empty, set the stop_event.
     """
-    await log.debug("Starting file read worker...", pbar=pbar)
+    await log.debug("Starting file read worker...")
 
     async for username in iterlines(username_path):
         async for password in iterlines(password_path):
@@ -126,8 +126,6 @@ async def producer(
             await queue.put(cp)
 
     await queue.join()
-
-    stop_event.set()
 
 
 async def lines_in_file(path: Path) -> int:
@@ -147,16 +145,14 @@ async def credential_pair_counter(
     Figure out how many credential pairs there are in the username and password files
     and update the progress bar with that number.
     """
-    await log.debug("Starting credential pair counter...", pbar=pbar)
+    await log.debug("Starting credential pair counter...")
 
     username_count = await lines_in_file(username_path)
     password_count = await lines_in_file(password_path)
 
     pbar.total = username_count * password_count
 
-    await log.debug(
-        "Total credential pairs counted, progress bar now displaying.", pbar=pbar
-    )
+    await log.debug("Total credential pairs counted, progress bar now displaying.")
 
 
 async def process_all(
@@ -174,10 +170,10 @@ async def process_all(
     queue: asyncio.Queue[CredPair] = asyncio.Queue(maxsize=queue_maxsize)
     pbar = tqdm(unit=" requests", leave=False)
 
-    stop_event = asyncio.Event()
     found_event = asyncio.Event()
 
     all_tasks = set()
+    nonterminating_tasks = set()
 
     for i in range(consumer_count):
         consumer_task = asyncio.create_task(
@@ -186,10 +182,8 @@ async def process_all(
                 pbar=pbar,
                 url=url,
                 stop_on_found=stop_on_found,
-                stop_event=stop_event,
                 found_event=found_event,
             ),
-            name=f"consumer-{i}",
         )
         all_tasks.add(consumer_task)
 
@@ -198,10 +192,8 @@ async def process_all(
             username_path=username_path,
             password_path=password_path,
             queue=queue,
-            stop_event=stop_event,
             pbar=pbar,
         ),
-        name="producer",
     )
     all_tasks.add(producer_task)
 
@@ -211,25 +203,35 @@ async def process_all(
             password_path=password_path,
             pbar=pbar,
         ),
-        name="counter",
     )
     all_tasks.add(counter_task)
+    nonterminating_tasks.add(counter_task)
 
-    # by only waiting on the event, any task exceptions thrown won't bubble.
-    # TODO: fix this later, somehow. i want to see exceptions.
-    await stop_event.wait()
+    while True:
+        done, pending = await asyncio.wait(all_tasks, return_when="FIRST_COMPLETED")
+
+        # we want exceptions to be raised if they've occured in a task. calling
+        # Task.result() will do that (or just return the value of the coro if none was
+        # raised).
+        for task in done:
+            task.result()
+
+        # if a terminating task is done, break from this loop and shut 'er down.
+        terminate = any(task not in nonterminating_tasks for task in done)
+        if terminate:
+            break
 
     pbar.clear()
     pbar.close()
 
-    for task in all_tasks:
+    for task in pending:
         if not task.done():
             task.cancel()
 
-    await asyncio.gather(*all_tasks, return_exceptions=True)
+    await asyncio.gather(*pending, return_exceptions=True)
 
     if not found_event.is_set():
-        await log.info("Could not find working credentials 😢", pbar=pbar)
+        await log.info("Could not find working credentials 😢")
         return False
 
     return True
@@ -267,7 +269,7 @@ def main(
     and PASSWORD_PATH.
 
     Credential pairs that yield responses with status codes < 400 are considered working
-    and will be printed to stdout.
+    and will be printed to stdout as JSON documents, one per line.
 
     Returns with an exit code of 0 if a working credential pair was found and 1 if not.
     """

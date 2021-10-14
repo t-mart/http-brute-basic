@@ -167,6 +167,10 @@ async def process_all(
     Start tasks that read from the username and password paths and run GET requests
     to try them out.
     """
+    log.info(
+        f"Brute forcing basic auth on {url} with usernames from {username_path} and "
+        f"passwords from {password_path}"
+    )
 
     queue: asyncio.Queue[CredPair] = asyncio.Queue(maxsize=queue_maxsize)
     pbar = tqdm(unit=" requests", leave=False)

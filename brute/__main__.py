@@ -42,7 +42,7 @@ async def get(
             return response.status_code < 400
         except httpx.ReadTimeout:
             # just log and try again? maybe do some kind of congestion control later
-            await log.warn(
+            log.warn(
                 f"Retrying because read timeout for request {request} and {cred_pair}",
             )
 
@@ -73,7 +73,7 @@ async def consumer(
     If one is successful, set the found_event and, if stop_on_found is True, also set
     the stop_event.
     """
-    await log.debug("Starting HTTP request worker...")
+    log.debug("Starting HTTP request worker...")
 
     async with httpx.AsyncClient() as client:
         request = client.build_request("GET", url)
@@ -99,7 +99,7 @@ async def consumer(
 
             if result:
                 found_event.set()
-                await log.info("Found working credentials 😀")
+                log.info("Found working credentials 😀")
                 pbar.write(
                     cred_pair.json_str(),
                     file=sys.stdout,
@@ -118,7 +118,7 @@ async def producer(
     Populate the queue with username:password pairs and wait for the queue to be
     emptied. On empty, set the stop_event.
     """
-    await log.debug("Starting file read worker...")
+    log.debug("Starting file read worker...")
 
     async for username in iterlines(username_path):
         async for password in iterlines(password_path):
@@ -145,14 +145,14 @@ async def credential_pair_counter(
     Figure out how many credential pairs there are in the username and password files
     and update the progress bar with that number.
     """
-    await log.debug("Starting credential pair counter...")
+    log.debug("Starting credential pair counter...")
 
     username_count = await lines_in_file(username_path)
     password_count = await lines_in_file(password_path)
 
     pbar.total = username_count * password_count
 
-    await log.debug("Total credential pairs counted, progress bar now displaying.")
+    log.debug("Total credential pairs counted, progress bar now displaying.")
 
 
 async def process_all(
@@ -167,6 +167,7 @@ async def process_all(
     Start tasks that read from the username and password paths and run GET requests
     to try them out.
     """
+
     queue: asyncio.Queue[CredPair] = asyncio.Queue(maxsize=queue_maxsize)
     pbar = tqdm(unit=" requests", leave=False)
 
@@ -221,7 +222,6 @@ async def process_all(
         if terminate:
             break
 
-    pbar.clear()
     pbar.close()
 
     for task in pending:
@@ -231,7 +231,7 @@ async def process_all(
     await asyncio.gather(*pending, return_exceptions=True)
 
     if not found_event.is_set():
-        await log.info("Could not find working credentials 😢")
+        log.info("Could not find working credentials 😢")
         return False
 
     return True

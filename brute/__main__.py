@@ -1,8 +1,11 @@
-import asyncio
+from __future__ import annotations
 import json
 import sys
-from collections.abc import AsyncIterator
+import asyncio
+from typing import Any, Optional
+from collections.abc import AsyncIterator, Callable, Coroutine
 from pathlib import Path
+from contextvars import ContextVar
 
 import aiofiles
 import attr
@@ -11,9 +14,21 @@ import typer
 from tqdm import tqdm
 
 from brute import log
+from brute.queue import Item, Queue, StopReason
+
+async_client_var: ContextVar[httpx.AsyncClient] = ContextVar("async_client")
+request_var: ContextVar[httpx.Request] = ContextVar("request")
+pbar_var: ContextVar[tqdm] = ContextVar("pbar")
+stop_on_found_var: ContextVar[bool] = ContextVar("stop_on_found")
+results_var: ContextVar[Results] = ContextVar("results")
 
 
-@attr.s(frozen=True, order=False, auto_attribs=True, kw_only=True)
+@attr.mutable(kw_only=True)
+class Results:
+    found_working_credentials: bool = attr.field(default=False)
+
+
+@attr.frozen(kw_only=True)
 class CredPair:
     username: str
     password: str
@@ -22,29 +37,53 @@ class CredPair:
         return json.dumps(attr.asdict(self))
 
 
-async def get(
-    cred_pair: CredPair,
-    request: httpx.Request,
-    client: httpx.AsyncClient,
-) -> bool:
-    """
-    Return True if the request against URL with the credentials in cred_pair has a
-    status code of < 400.
+@attr.frozen(kw_only=True)
+class RequestItem(Item):
+    cred_pair: CredPair
 
-    Retry the request if an httpx.ReadTimeout exception is raised.
-    """
+    async def process(
+        self, enqueue: Callable[[Item], Coroutine[Any, Any, None]]
+    ) -> Optional[StopReason]:
+        request = request_var.get()
+        client = async_client_var.get()
+        pbar = pbar_var.get()
+        stop_on_found = stop_on_found_var.get()
+        results = results_var.get()
 
-    while True:
-        try:
-            response = await client.send(
-                request, auth=(cred_pair.username, cred_pair.password)
+        success = False
+
+        while True:
+            try:
+                pbar.set_postfix_str(
+                    (
+                        f"username={self.cred_pair.username[:10]: <10}, "
+                        f"password={self.cred_pair.password[:10]: <10}"
+                    ),
+                    refresh=False,
+                )
+                pbar.update()
+                response = await client.send(
+                    request, auth=(self.cred_pair.username, self.cred_pair.password)
+                )
+                success = response.status_code < 400
+            except httpx.ReadTimeout:
+                # just log and try again? maybe do some kind of congestion control later
+                log.warn(
+                    f"Retrying because read timeout for request {request} and {self.cred_pair}"
+                )
+            break
+
+        if success:
+            results.found_working_credentials = True
+            log.info("Found working credentials 😀")
+            pbar.write(
+                self.cred_pair.json_str(),
+                file=sys.stdout,
             )
-            return response.status_code < 400
-        except httpx.ReadTimeout:
-            # just log and try again? maybe do some kind of congestion control later
-            log.warn(
-                f"Retrying because read timeout for request {request} and {cred_pair}",
-            )
+            if stop_on_found:
+                return StopReason(reason="Stopping because working credentials have been found.")
+
+        return None
 
 
 async def iterlines(path: Path) -> AsyncIterator[str]:
@@ -60,72 +99,18 @@ async def iterlines(path: Path) -> AsyncIterator[str]:
         raise ValueError(f"Path {path} is not a readable file")
 
 
-async def consumer(
-    queue: asyncio.Queue[CredPair],
-    pbar: tqdm,
-    url: str,
-    stop_on_found: bool,
-    found_event: asyncio.Event,
-) -> None:
-    """
-    Get username:password pairs from the queue and try them against the url.
+@attr.frozen(kw_only=True)
+class CredentialLoaderItem(Item):
+    username_path: Path
+    password_path: Path
 
-    If one is successful, set the found_event and, if stop_on_found is True, also set
-    the stop_event.
-    """
-    log.debug("Starting HTTP request worker...")
-
-    async with httpx.AsyncClient() as client:
-        request = client.build_request("GET", url)
-
-        while True:
-            cred_pair = await queue.get()
-
-            result = await get(
-                cred_pair=cred_pair,
-                request=request,
-                client=client,
-            )
-
-            queue.task_done()
-            pbar.set_postfix_str(
-                (
-                    f"username={cred_pair.username[:10]: <10}, "
-                    f"password={cred_pair.password[:10]: <10}"
-                ),
-                refresh=False,
-            )
-            pbar.update()
-
-            if result:
-                found_event.set()
-                log.info("Found working credentials 😀")
-                pbar.write(
-                    cred_pair.json_str(),
-                    file=sys.stdout,
-                )
-                if stop_on_found:
-                    return
-
-
-async def producer(
-    username_path: Path,
-    password_path: Path,
-    queue: asyncio.Queue[CredPair],
-    pbar: tqdm,
-) -> None:
-    """
-    Populate the queue with username:password pairs and wait for the queue to be
-    emptied. On empty, set the stop_event.
-    """
-    log.debug("Starting file read worker...")
-
-    async for username in iterlines(username_path):
-        async for password in iterlines(password_path):
-            cp = CredPair(username=username, password=password)
-            await queue.put(cp)
-
-    await queue.join()
+    async def process(
+        self, enqueue: Callable[[Item], Coroutine[Any, Any, None]]
+    ) -> None:
+        async for username in iterlines(self.username_path):
+            async for password in iterlines(self.password_path):
+                cred_pair = CredPair(username=username, password=password)
+                await enqueue(RequestItem(cred_pair=cred_pair))
 
 
 async def lines_in_file(path: Path) -> int:
@@ -136,26 +121,25 @@ async def lines_in_file(path: Path) -> int:
     return count
 
 
-async def credential_pair_counter(
-    username_path: Path,
-    password_path: Path,
-    pbar: tqdm,
-) -> None:
-    """
-    Figure out how many credential pairs there are in the username and password files
-    and update the progress bar with that number.
-    """
-    log.debug("Starting credential pair counter...")
+@attr.frozen(kw_only=True)
+class CredentialCounterItem(Item):
+    username_path: Path
+    password_path: Path
 
-    username_count = await lines_in_file(username_path)
-    password_count = await lines_in_file(password_path)
+    async def process(
+        self, enqueue: Callable[[Item], Coroutine[Any, Any, None]]
+    ) -> None:
+        pbar = pbar_var.get()
 
-    pbar.total = username_count * password_count
+        username_count = await lines_in_file(self.username_path)
+        password_count = await lines_in_file(self.password_path)
 
-    log.debug("Total credential pairs counted, progress bar now displaying.")
+        pbar.total = username_count * password_count
+
+        log.debug("Total credential pairs counted, progress bar now displaying.")
 
 
-async def process_all(
+async def start_queue(
     url: str,
     username_path: Path,
     password_path: Path,
@@ -172,69 +156,43 @@ async def process_all(
         f"passwords from {password_path}"
     )
 
-    queue: asyncio.Queue[CredPair] = asyncio.Queue(maxsize=queue_maxsize)
+    # queue: asyncio.Queue[CredPair] = asyncio.Queue(maxsize=queue_maxsize)
     pbar = tqdm(unit=" requests", leave=False)
+    pbar_var.set(pbar)
 
-    found_event = asyncio.Event()
+    stop_on_found_var.set(stop_on_found)
 
-    all_tasks = set()
-    nonterminating_tasks = set()
+    results = Results()
+    results_var.set(results)
 
-    for i in range(consumer_count):
-        consumer_task = asyncio.create_task(
-            consumer(
-                queue=queue,
-                pbar=pbar,
-                url=url,
-                stop_on_found=stop_on_found,
-                found_event=found_event,
-            ),
+    async with httpx.AsyncClient() as client:
+        async_client_var.set(client)
+
+        request = client.build_request("GET", url)
+        request_var.set(request)
+
+        queue = Queue.create(
+            queue_maxsize=queue_maxsize,
+            stop_reason_callback=lambda sr: log.info(str(sr)),
         )
-        all_tasks.add(consumer_task)
 
-    producer_task = asyncio.create_task(
-        producer(
-            username_path=username_path,
-            password_path=password_path,
-            queue=queue,
-            pbar=pbar,
-        ),
-    )
-    all_tasks.add(producer_task)
-
-    counter_task = asyncio.create_task(
-        credential_pair_counter(
-            username_path=username_path,
-            password_path=password_path,
-            pbar=pbar,
-        ),
-    )
-    all_tasks.add(counter_task)
-    nonterminating_tasks.add(counter_task)
-
-    while True:
-        done, pending = await asyncio.wait(all_tasks, return_when="FIRST_COMPLETED")
-
-        # we want exceptions to be raised if they've occured in a task. calling
-        # Task.result() will do that (or just return the value of the coro if none was
-        # raised).
-        for task in done:
-            task.result()
-
-        # if a terminating task is done, break from this loop and shut 'er down.
-        terminate = any(task not in nonterminating_tasks for task in done)
-        if terminate:
-            break
+        await queue.complete(
+            initial_items=[
+                CredentialLoaderItem(
+                    username_path=username_path,
+                    password_path=password_path,
+                ),
+                CredentialCounterItem(
+                    username_path=username_path,
+                    password_path=password_path,
+                ),
+            ],
+            worker_count=consumer_count,
+        )
 
     pbar.close()
 
-    for task in pending:
-        if not task.done():
-            task.cancel()
-
-    await asyncio.gather(*pending, return_exceptions=True)
-
-    if not found_event.is_set():
+    if not results.found_working_credentials:
         log.info("Could not find working credentials 😢")
         return False
 
@@ -278,7 +236,7 @@ def main(
     Returns with an exit code of 0 if a working credential pair was found and 1 if not.
     """
     found = asyncio.run(
-        process_all(
+        start_queue(
             url=url,
             username_path=username_path,
             password_path=password_path,
@@ -289,10 +247,7 @@ def main(
         debug=asyncio_debug,
     )
 
-    if found:
-        sys.exit(0)
-
-    sys.exit(1)
+    raise typer.Exit(0 if found else 1)
 
 
 if __name__ == "__main__":

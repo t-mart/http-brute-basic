@@ -1,21 +1,23 @@
+src-paths = brute server
+
 .PHONY: all
 all: black flake8 isort mypy
 
 .PHONY: mypy
 mypy:
-	mypy brute server
+	mypy $(src-paths)
 
 .PHONY: isort
 isort:
-	isort brute server
+	isort $(src-paths)
 
 .PHONY: flake8
 flake8:
-	flake8 brute server
+	flake8 $(src-paths)
 
 .PHONY: black
 black:
-	black brute server
+	black $(src-paths)
 
 .PHONY: sync-requirements
 sync-requirements: compile-requirements compile-requirements-dev
